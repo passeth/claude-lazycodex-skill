@@ -47,6 +47,14 @@ chmod +x ~/.claude/skills/lazycodex/scripts/codex-pane.sh
 
 다음번 Claude Code를 켜면 자동으로 인식됩니다. (`/skills` 로 확인 가능)
 
+설치 뒤 tmux 안에서 준비 상태를 확인할 수 있습니다:
+
+```bash
+~/.claude/skills/lazycodex/scripts/codex-pane.sh doctor
+```
+
+`doctor`는 tmux 세션 여부, `codex` CLI, LazyCodex 플러그인 설정(`omo@sisyphuslabs`), 현재 Codex pane 상태를 점검합니다.
+
 ## 사용법
 
 **tmux 안에서** Claude Code를 켜고, 그냥 평소처럼 말하면 됩니다:
@@ -76,9 +84,11 @@ chmod +x ~/.claude/skills/lazycodex/scripts/codex-pane.sh
 ## 안에 뭐가 들어있나요?
 
 - **`SKILL.md`** — Claude가 따르는 지휘 절차 (이 파일이 스킬의 두뇌)
+- **`REFERENCE.md`** — pane 제어, 완료 토큰, 복구, 검증 경계에 대한 세부 운영 참고
 - **`scripts/codex-pane.sh`** — tmux 칸을 제어하는 작은 스크립트. 창마다 Codex 칸 하나만 관리하며, 몇 번을 호출해도 안전(idempotent)합니다:
 
   ```
+  codex-pane.sh doctor            tmux·codex·LazyCodex 설정 점검
   codex-pane.sh start [프롬프트]   칸 만들고 codex 실행 (이미 있으면 재사용)
   codex-pane.sh send "<글>"        codex 입력창에 붙여넣고 전송
   codex-pane.sh peek [줄수]        최근 출력 보기 (기본 60줄)
@@ -90,10 +100,15 @@ chmod +x ~/.claude/skills/lazycodex/scripts/codex-pane.sh
 
 ## 알아두면 좋은 점
 
+- `start [프롬프트]`는 먼저 `codex` TUI가 뜰 때까지 기다린 뒤 프롬프트를 붙여넣습니다. 셸 인자 quoting 문제로 긴 요청이 깨지는 일을 줄이기 위한 방식입니다.
 - `$ulw-loop`의 완료 토큰은 짧게(30자 미만) — 화면에서 줄바꿈되면 감지를 못 합니다.
 - Codex가 한 작업을 **사용자 확인 없이 커밋하지 않습니다.**
 - Codex가 위험한 작업(파일 삭제, 설치, 네트워크 등)을 요청하면 자동 승인하지 않고 사용자에게 물어봅니다.
 - 간단한 일회성 Codex 질문용은 아닙니다 — 그건 가벼운 `/codex` 계열 스킬을 쓰세요.
+
+## 참고한 설계
+
+이 저장소는 [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)의 운영 방식을 참고했습니다. 특히 setup/status/result 같은 작은 명령으로 실행 상태를 분리하고, Claude가 직접 코드를 만지는 대신 Codex 실행 경계와 검증 경계를 명확히 나누는 패턴을 반영했습니다.
 
 ## 만든 배경 / 크레딧
 
