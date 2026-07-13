@@ -35,16 +35,32 @@ if LazyCodex is missing, offer `npx lazycodex-ai install`.
 
 | Situation | Codex command to dispatch | Done signal |
 | --- | --- | --- |
-| Needs decisions/design before code | `$ulw-plan "<what to build>"` | plan file appears in `plans/*.md` + pane idle |
-| A plan exists, execute it | `$start-work <plan-name>` | text `ORCHESTRATION COMPLETE` |
-| Open-ended goal, run until verified (the "goal" mode) | `$ulw-loop "<task>" --completion-promise="LAZYCODEX_DONE_<slug>"` | the completion-promise token |
-| Parallelizable work needing coordination | `$teammode` request (see below) | pane idle + leader summary |
+| Needs decisions/design before code | `$ulw-plan "<what to build>"` | `wait-done` sentinel |
+| A plan exists, execute it | `$start-work <plan-name>` | `wait-done` sentinel |
+| Open-ended goal, run until verified (the "goal" mode) | `$ulw-loop "<task>" --completion-promise="<TOKEN>"` | `wait-done` sentinel |
+| Parallelizable work needing coordination | `$teammode` request (see below) | `wait-done` sentinel |
 
-- Always pass an explicit `--completion-promise` to `$ulw-loop` so there is a
-  deterministic marker to wait for. Use a short (<30 chars, so it never line-wraps in
-  the TUI) uppercase token unlikely to appear otherwise. `wait` ignores `›`-prefixed
-  lines (echoed prompts), so the token in your own dispatch won't self-match — but it
-  must fit on one line in codex's output to be detected.
+**Completion is a file, never screen text.** Allocate a sentinel before dispatching and
+tell codex to `touch` it as the last step; block on `wait-done`, not `wait`:
+
+```bash
+DONE=$($PANE done-file <slug>)      # prints path, clears any stale one
+# ...append to the dispatch prompt:
+#   "When the work is complete and verified, run exactly: touch $DONE"
+$PANE wait-done <slug> 570          # exit 0 = really done | 3 = timeout | 4 = pane died
+```
+
+Do **not** use `$PANE wait '<TOKEN>'` to detect a completion promise. Codex wraps a long
+prompt across several rendered lines and only the *first* carries the `›` prefix, so the
+token sitting in your own dispatched prompt matches immediately — `wait` returns "done"
+seconds after dispatch, while codex is still loading. Measured: exit 0 after 6s, zero
+files changed. Since this skill also tells you to write long self-contained prompts, the
+recommended usage is exactly what triggers it. `wait` remains safe only for markers codex
+prints that you never typed (e.g. `ORCHESTRATION COMPLETE`), and even then the sentinel
+is the better signal.
+
+- Still pass `--completion-promise` to `$ulw-loop` — it is what makes the harness keep
+  iterating until it believes the goal is met. Just don't *detect* on it.
 - For teammode, phrase the dispatch as: `$teammode — create a team to <goal>. Members: <one per
   concrete part/ownership area>. Report a final summary when the team's work is merged.`
   On the orca backend, prefer the Orca A2A multi-worker mode (below) over `$teammode`:
@@ -55,12 +71,13 @@ if LazyCodex is missing, offer `npx lazycodex-ai install`.
 ## Dispatch
 
 ```bash
-$PANE start                      # creates the pane (idempotent), prints pane id
-$PANE send '$ulw-loop "fix the flaky auth test" --completion-promise="LAZYCODEX_DONE_AUTH"'
+DONE=$($PANE done-file auth)     # allocate the sentinel FIRST
+$PANE start "\$ulw-loop \"fix the flaky auth test\" --completion-promise=\"LCX_DONE_AUTH\"
+When the work is complete and verified, run exactly: touch $DONE"
 ```
 
-Or launch with the prompt in one shot (avoids composer paste entirely — preferred
-for the first command): `$PANE start '$ulw-loop "..." --completion-promise="..."'`
+Launching with the prompt in one shot is preferred for the first command (it avoids the
+composer paste entirely). For follow-ups use `$PANE send '<text>'`.
 
 After every `send`, immediately `$PANE peek 30` to confirm the message was actually
 submitted (codex should show it as a user message / start working). If the `$` prefix
@@ -77,27 +94,56 @@ Run waits with `run_in_background: true` so you're re-invoked when they return, 
 other useful work meanwhile (read the plan file, prep verification commands).
 
 ```bash
-$PANE wait 'ORCHESTRATION COMPLETE|LAZYCODEX_DONE_AUTH' 570   # done marker
-$PANE status        # BUSY | IDLE | BLOCKED (herdr only) | NO_PANE
-$PANE peek 80       # read recent output to summarize progress for the user
+$PANE wait-done auth 570   # THE completion signal: 0 = done | 3 = timeout | 4 = pane died
+$PANE status               # BUSY | IDLE | BLOCKED (herdr only) | NO_PANE
+$PANE peek 80              # read recent output to summarize progress for the user
 ```
 
-On herdr, `status` uses herdr's native agent detection, so it can also return
-`BLOCKED` — codex is waiting on an approval or a question. Treat that exactly like
-the "codex asked a question" triage case below: `peek`, then answer via `send`.
-On orca, `status` uses orca's native `tui-idle` probe (a BUSY/IDLE answer takes
-~1.5s); `peek` reads the codex screen via `orca terminal read`, which can garble
-the TUI status line — trust `status` over screen-grepping for busy/idle.
+`status` is deliberately biased toward BUSY: any working marker on codex's own screen
+(`esc to interrupt`, `Working (…)`, `Waiting for agents`) wins over the backend's idle
+probe. That asymmetry is the point — a false BUSY costs one wasted poll, a false IDLE
+lets you edit a tree codex is still writing. On orca the native `tui-idle` probe reports
+*idle* while `$ulw-loop` blocks on fanned-out subagents, so the screen is right and the
+probe is wrong; never trust the probe over visible work. On herdr, `status` can also
+return `BLOCKED` — codex is waiting on an approval or a question; triage it like the
+"codex asked a question" case below.
+
+**`IDLE` is not `done`.** Only the sentinel means done. An idle pane with no sentinel is
+a codex that stopped early, is between subagent phases, or is waiting on you.
 
 Loop protocol:
-1. `wait` for the done marker. On exit 3 (timeout), `peek` and triage:
+1. `wait-done` for the sentinel. On exit 3 (timeout), `peek` and triage:
    - Still working (spinner, new output since last peek) → report progress to the user
-     in one line, `wait` again.
+     in one line, `wait-done` again.
    - Codex asked a question or is `BLOCKED:` → answer it via `$PANE send '...'`.
      Decisions you can make from repo context, make; genuine user decisions, surface.
-   - Pane is IDLE without the marker → codex may have stopped early. `peek 120`, read
-     what happened, and either `send` a follow-up instruction or treat as done-claimed.
+   - Pane is IDLE without the sentinel → codex may have stopped early. `peek 120`, read
+     what happened, and either `send` a follow-up instruction (including a reminder to
+     `touch` the sentinel when done) or stop the pane and re-dispatch.
+   - Exit 4 (pane died) → tell the user; `codex resume --last` can recover the session.
 2. Repeat. No fixed iteration cap — the harness itself caps ulw-loop iterations.
+
+## Concurrency: the repo has one writer
+
+While the codex pane is alive, **codex owns the working tree. You do not touch it.**
+No edits, no `git checkout/stash/commit`, no build-fixing "while we wait" — not even a
+file codex isn't looking at. Codex re-reads the tree as it works, and it is executing an
+older brief than the conversation you are in.
+
+This is not theoretical. A user changed requirements mid-run, the orchestrator edited the
+files to match, and codex — faithfully serving its stale brief — reverted those edits
+twice as "requirement violations". It was caught by luck just before commit. Under a
+false-completion signal (above), the orchestrator starts editing *while codex is still
+writing*, and the human's newest decision silently loses.
+
+- **Changed your mind mid-run?** `$PANE stop` → make the edits → re-dispatch with a fresh
+  brief. Never edit around a live pane.
+- **Verification happens after the sentinel**, never before. That is the whole reason
+  completion detection has to be trustworthy.
+- **Prefer isolation for long runs.** On orca, give `$ulw-loop` its own checkout
+  (`orca worktree create --name <slug> --agent codex --json`). Then codex writes to its
+  own tree, and a bad completion signal degrades to "I read a stale diff" instead of two
+  writers silently clobbering each other.
 
 ## Orca A2A multi-worker mode
 
@@ -158,14 +204,19 @@ Rules (mirror orca's official orchestration conventions):
   Step 1 - run exactly this harness command in your composer:
   $ulw-loop "<the actual task>" --completion-promise="LCX_DONE_<SLUG>"
 
-  Step 2 - once the harness prints LCX_DONE_<SLUG>, send worker_done exactly as your
-  dispatch preamble instructs, with reportPath=<path>.
+  Step 2 - once the harness prints LCX_DONE_<SLUG>, do BOTH, in this order:
+    a) run exactly: touch <sentinel path from `$PANE done-file <slug>`>
+    b) send worker_done exactly as your dispatch preamble instructs, with reportPath=<path>.
   ```
 
   The harness loop and the dispatch lifecycle do **not** conflict: `$ulw-loop` runs to its
   own completion promise, and only then does the worker report. Verified end-to-end — the
   worker ran the loop, hit its promise token, wrote its report, and issued a correct
   `worker_done` (matching taskId/dispatchId/coordinator handle).
+
+  The sentinel in (a) is not redundant: `worker_done` has been observed to go missing (see
+  below), and it is the only completion signal a coordinator can poll without the message
+  bus. Wait on `check --wait` *and* the sentinel files; whichever lands first is the truth.
 - Run `check --wait` with `run_in_background: true` (keep `--timeout-ms` ≤ 570000,
   under the Bash timeout). A timeout or `{count:0}` is a checkpoint, NOT a failure —
   coding tasks run 15–60 min. Liveness-check with `orca terminal read`/`tui-idle`,
@@ -201,16 +252,25 @@ Rules (mirror orca's official orchestration conventions):
 
 ## Verify (Claude's job, never skipped)
 
-Codex saying done ≠ done. After the done signal, verify from YOUR pane:
+Codex saying done ≠ done. **Verify only after the sentinel lands** — verifying against a
+tree codex is still writing is the race described under Concurrency, and it is worse than
+not verifying at all. Re-confirm before you touch anything:
+
+```bash
+$PANE wait-done <slug> 570 && $PANE status   # sentinel present AND pane not BUSY
+```
+
+Then, from YOUR pane:
 
 - `git -C <repo> status && git diff --stat` — what actually changed.
 - Run the project's checks yourself (for this machine's projects typically
   `pnpm tsc --noEmit` / `pnpm build` / tests).
 - Spot-read the changed files against the original ask.
 
-If verification fails, send the failure evidence back:
-`$PANE send 'Verification failed: <exact error>. Fix it. The completion promise stands.'`
-and re-enter the monitor loop.
+If verification fails, do **not** fix it yourself in the shared tree. Send the failure
+evidence back and let codex own the edit:
+`$PANE send 'Verification failed: <exact error>. Fix it, then touch <sentinel> again.'`
+(`$PANE done-file <slug>` first, to clear the old sentinel.) Then re-enter the monitor loop.
 
 ## Wrap up
 
@@ -232,3 +292,11 @@ and re-enter the monitor loop.
   via `$PANE start` args can recover the session if they want to continue.
 - If codex requests approval for a risky action (destructive command, network, install),
   relay it to the user instead of auto-approving.
+- **Codex runs unsandboxed and inherits the project environment.** It gets a real shell in
+  the repo, with whatever `.env` / credentials that repo carries. In a repo wired to a
+  production database, "don't touch the DB" is a sentence in a prompt, not an enforcement
+  boundary — nothing stops a harness iteration from running a migration or a destructive
+  query against prod. Before dispatching into such a repo: confirm with the user, state in
+  the prompt which environments are off-limits, and prefer an isolated worktree with
+  non-production credentials. Combined with an unreliable completion signal and a shared
+  working tree, the worst case here is not a lost edit.

@@ -182,29 +182,61 @@ orca orchestration check --wait --types worker_done,escalation,decision_gate --t
   안전(idempotent)합니다:
 
   ```
-  codex-pane.sh doctor            실행 환경·codex·LazyCodex 설정 점검
-  codex-pane.sh start [프롬프트]   칸 만들고 codex 실행 (이미 있으면 재사용)
-  codex-pane.sh send "<글>"        codex 입력창에 붙여넣고 전송
-  codex-pane.sh peek [줄수]        최근 출력 보기 (기본 60줄)
-  codex-pane.sh status            BUSY(작업중) | IDLE(대기) | BLOCKED(herdr) | NO_PANE(없음)
-  codex-pane.sh wait "<패턴>" [초] 그 패턴이 나올 때까지 기다리기
-  codex-pane.sh wait-idle [초]     codex가 멈출 때까지 기다리기
-  codex-pane.sh keys <키...>       키 입력 (Escape, Enter, C-c ...)
-  codex-pane.sh focus             codex 칸을 화면에 드러내기 (tmux/orca)
-  codex-pane.sh stop              codex 중단하고 칸 닫기
-  codex-pane.sh backend           활성 백엔드 출력 (tmux | herdr | orca)
+  codex-pane.sh doctor              실행 환경·codex·LazyCodex 설정 점검
+  codex-pane.sh start [프롬프트]     칸 만들고 codex 실행 (이미 있으면 재사용)
+  codex-pane.sh send "<글>"          codex 입력창에 붙여넣고 전송
+  codex-pane.sh peek [줄수]          최근 출력 보기 (기본 60줄)
+  codex-pane.sh status              BUSY(작업중) | IDLE(대기) | BLOCKED(herdr) | NO_PANE(없음)
+  codex-pane.sh done-file <슬러그>   완료 표식 파일 경로 발급 (묵은 표식 삭제)
+  codex-pane.sh wait-done <슬러그>   ★ 진짜 완료 신호 — codex가 표식을 touch할 때까지 대기
+  codex-pane.sh wait "<패턴>" [초]   그 패턴이 나올 때까지 대기 (직접 타이핑한 토큰엔 쓰지 말 것)
+  codex-pane.sh wait-idle [초]       codex가 멈출 때까지 대기
+  codex-pane.sh keys <키...>         키 입력 (Escape, Enter, C-c ...)
+  codex-pane.sh focus               codex 칸을 화면에 드러내기 (tmux/orca)
+  codex-pane.sh stop                codex 중단하고 칸 닫기
+  codex-pane.sh backend             활성 백엔드 출력 (tmux | herdr | orca)
   ```
 
   환경변수: `LAZYCODEX_BACKEND=tmux|herdr|orca` 로 감지를 덮어쓰고,
   `LAZYCODEX_PANE_NAME=<이름>` 으로 이름별 pane 여러 개를 병행 관리합니다.
 
+## ⚠️ 반드시 알아야 할 3가지
+
+**1. 완료는 화면 글자가 아니라 파일로 판단합니다.** 예전 방식(`wait "<완료토큰>"`)은 **거짓 완료**를
+냅니다. codex는 긴 프롬프트를 여러 줄로 감싸 렌더하는데 **첫 줄에만 `›` 접두어**가 붙습니다. 완료 토큰이
+뒷줄에 놓이면 **자기가 방금 보낸 프롬프트에 자기가 매칭**됩니다. 실측: 디스패치 6초 만에 "완료" 반환,
+그때 codex는 아직 로딩 중이고 변경 파일 0건. 스킬이 "프롬프트를 자기완결적으로(=길게) 쓰라"고 하니
+**권장대로 쓸수록 확실히 터집니다.** 그래서 이제 sentinel 파일을 씁니다:
+
+```bash
+DONE=$(codex-pane.sh done-file auth)
+codex-pane.sh start "\$ulw-loop \"...\" --completion-promise=\"LCX_DONE_AUTH\"
+When the work is complete and verified, run exactly: touch $DONE"
+codex-pane.sh wait-done auth 570      # 0=완료 | 3=타임아웃 | 4=pane 죽음
+```
+파일은 화면 에코로 위조되지 않고, TUI 리드로우·스크롤백에도 안전하며, 백엔드 독립적입니다.
+
+**2. `IDLE`은 `완료`가 아닙니다.** `status`는 이제 **BUSY 쪽으로 편향**돼 있습니다 — 화면에
+`esc to interrupt`, `Working (…)`, `Waiting for agents` 중 하나라도 보이면 백엔드 프로브보다 우선합니다.
+비대칭이 핵심입니다: 거짓 BUSY는 폴링 한 번 낭비지만, **거짓 IDLE은 codex가 쓰고 있는 트리를 덮어쓰게**
+만듭니다. (orca의 `tui-idle`은 `$ulw-loop`가 서브에이전트를 팬아웃하는 동안 idle이라고 답합니다 — 화면이
+맞고 프로브가 틀립니다.)
+
+**3. codex 칸이 살아 있는 동안 레포 파일을 건드리지 마세요.** codex가 워킹트리의 소유자입니다.
+실제 사고: 작업 도중 사용자가 요구사항을 바꿔 오케스트레이터가 파일을 고쳤더니, **옛 지시문을 들고 있던
+codex가 그걸 "요구사항 위반"으로 보고 두 번 되돌렸습니다.** codex 잘못이 아니라 stale brief를 성실히
+수행한 결과입니다. 커밋 직전에 겨우 잡았습니다. **방향을 바꾸려면 `stop` → 편집 → 재디스패치.**
+긴 작업은 아예 격리된 체크아웃(`orca worktree create --agent codex`)에 맡기는 게 안전합니다.
+
 ## 알아두면 좋은 점
 
 - `start [프롬프트]`는 먼저 `codex` TUI가 뜰 때까지 기다린 뒤 프롬프트를 전달합니다.
   (orca에서는 네이티브 `tui-idle` 신호로 대기) 셸 인자 quoting 문제로 긴 요청이 깨지는 일을 줄이기 위한 방식입니다.
-- `$ulw-loop`의 완료 토큰은 짧게(30자 미만) — 화면에서 줄바꿈되면 감지를 못 합니다.
-- orca에서 `peek`는 TUI 화면을 읽는 특성상 상태줄이 뭉개질 수 있습니다 — 작업중/대기 판단은
-  `status`(네이티브 프로브)를 믿으세요.
+- `--completion-promise`는 **계속 넘기세요** — 하네스가 "될 때까지" 돌게 만드는 장치입니다. 다만 그걸로
+  **완료를 감지하지는** 마세요.
+- **codex는 샌드박스 없이 돌고 프로젝트 env를 상속합니다.** 프로덕션 크레덴셜이 있는 레포에서
+  "DB 건드리지 마라"는 프롬프트일 뿐 강제장치가 아닙니다. 그런 레포에 디스패치하기 전엔 사용자에게
+  확인하고, 격리된 워크트리 + 비프로덕션 크레덴셜을 쓰세요.
 - Codex가 한 작업을 **사용자 확인 없이 커밋하지 않습니다.**
 - Codex가 위험한 작업(파일 삭제, 설치, 네트워크 등)을 요청하면 자동 승인하지 않고 사용자에게 물어봅니다.
 - 간단한 일회성 Codex 질문용은 아닙니다 — 그건 가벼운 `/codex` 계열 스킬을 쓰세요.

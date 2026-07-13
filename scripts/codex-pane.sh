@@ -160,9 +160,22 @@ be_capture() {
   esac
 }
 
+screen_busy() {
+  # Does the codex screen itself claim to be working? A false BUSY only costs a
+  # wasted poll; a false IDLE lets the orchestrator edit a tree codex is writing.
+  # So any busy evidence wins over a backend probe that says idle.
+  # 'Waiting for agents' matters: $ulw-loop fans out subagents, and while the
+  # parent blocks on them orca's tui-idle probe reports idle even though the run
+  # is very much alive.
+  be_screen "$1" | grep -qiE 'esc to interrupt|Working \(|Waiting for agents|Waiting for subagent'
+}
+
 be_status() {
   # BUSY | IDLE | BLOCKED (BLOCKED only detectable on herdr)
-  local id="$1" st out
+  local id="$1" st
+  # Screen evidence of work outranks every backend probe (see screen_busy).
+  if screen_busy "$id"; then echo "BUSY"; return 0; fi
+
   if [ "$BACKEND" = "herdr" ]; then
     st="$(herdr pane get "$id" 2>/dev/null | grep -o '"agent_status":"[^"]*"' | cut -d'"' -f4 || true)"
     case "$st" in
@@ -173,9 +186,6 @@ be_status() {
     # agent_status unknown → fall through to screen heuristic
   fi
   if [ "$BACKEND" = "orca" ]; then
-    # dead PTY → IDLE; otherwise use orca's native TUI-idle probe (short window:
-    # ok → idle now, timeout → still working). Screen grep is unreliable here
-    # because alt-screen reads can interleave/garble the status line.
     st="$(orca terminal show --terminal "$id" --json 2>/dev/null | jq -r '.result.terminal.status // empty')"
     if [ -n "$st" ] && [ "$st" != "running" ]; then echo "IDLE"; return 0; fi
     if orca terminal wait --terminal "$id" --for tui-idle --timeout-ms 1500 --json 2>/dev/null \
@@ -186,8 +196,7 @@ be_status() {
     fi
     return 0
   fi
-  out="$(be_screen "$id")"
-  if echo "$out" | grep -qiE 'esc to interrupt'; then echo "BUSY"; else echo "IDLE"; fi
+  echo "IDLE"
 }
 
 be_kill() {
@@ -199,6 +208,13 @@ be_kill() {
 }
 
 # ---------- state ------------------------------------------------------------
+
+done_path() {
+  # done_path <slug> — sentinel file for one dispatch. Deterministic so the
+  # orchestrator and codex agree on it without passing state around.
+  local slug="$1"
+  printf '%s/%s%s-%s.done' "$STATE_DIR" "$KEY" "${LAZYCODEX_PANE_NAME:+-$LAZYCODEX_PANE_NAME}" "$slug"
+}
 
 get_pane() {
   [ -f "$STATE_FILE" ] || return 1
@@ -317,11 +333,57 @@ case "$cmd" in
     be_status "$id"
     ;;
 
+  done-file)
+    # done-file <slug> — print the sentinel path for a dispatch, clearing any stale
+    # one first. Call this BEFORE dispatching, and put the printed path in the prompt:
+    #   "When the work is complete and verified, run: touch <path>"
+    # Then block on `wait-done <slug>`. A file cannot be forged by the TUI echoing
+    # your own prompt back — which is exactly how text-marker `wait` gives a false
+    # completion (codex wraps a long prompt across lines; only the first carries '›').
+    slug="${1:?slug required}"
+    p="$(done_path "$slug")"
+    rm -f "$p"
+    echo "$p"
+    ;;
+
+  wait-done)
+    # wait-done <slug> [timeout] — block until codex touches the sentinel (default 570s).
+    # Exit 0 on completion, 3 on timeout, 4 if the pane died before completing.
+    slug="${1:?slug required}"
+    timeout="${2:-570}"
+    p="$(done_path "$slug")"
+    id="$(get_pane)" || die "no codex pane"
+    elapsed=0
+    while [ "$elapsed" -lt "$timeout" ]; do
+      if [ -e "$p" ]; then
+        echo "DONE: $p"
+        echo "---"
+        be_capture "$id" 40
+        exit 0
+      fi
+      if ! be_alive "$id"; then
+        echo "PANE DIED before completing (sentinel $p never appeared)"
+        exit 4
+      fi
+      sleep 5
+      elapsed=$((elapsed + 5))
+    done
+    echo "TIMEOUT after ${timeout}s — sentinel not created. status=$(be_status "$id"). last output:"
+    echo "---"
+    be_capture "$id" 40
+    exit 3
+    ;;
+
   wait)
     # wait "<regex>" [timeout] — block until regex appears in CODEX OUTPUT (default 570s).
-    # Lines starting with '›' (echoed user messages / composer) and with 'codex '
-    # (the shell line that launched codex — visible on orca) are excluded, so a
-    # done-token contained in the dispatched prompt does not self-match.
+    #
+    # WARNING: only safe for markers codex prints but YOU never typed (e.g.
+    # 'ORCHESTRATION COMPLETE' from $start-work). It CANNOT reliably detect a
+    # --completion-promise token: codex wraps long prompts across several lines and
+    # only the first line carries the '›' prefix, so the token sitting in your own
+    # dispatched prompt matches immediately and `wait` returns while codex is still
+    # starting up. For completion, use done-file + wait-done instead.
+    #
     # Exit 0 + tail on match, exit 3 on timeout.
     id="$(get_pane)" || die "no codex pane"
     pattern="${1:?pattern required}"
@@ -390,6 +452,7 @@ case "$cmd" in
     sleep 1
     be_kill "$id"
     rm -f "$STATE_FILE"
+    rm -f "$STATE_DIR/$KEY${LAZYCODEX_PANE_NAME:+-$LAZYCODEX_PANE_NAME}"-*.done
     echo "stopped"
     ;;
 
@@ -417,7 +480,11 @@ usage: codex-pane.sh <subcommand>          (backend: tmux, herdr, or orca — au
   send "<text>"             paste text into codex composer and submit
   peek [lines]              show last N lines of the pane (default 60)
   status                    BUSY | IDLE | BLOCKED (herdr only) | NO_PANE
-  wait "<regex>" [timeout]  block until regex appears (default 570s); exit 3 on timeout
+  done-file <slug>          print (and clear) the sentinel path for a dispatch
+  wait-done <slug> [timeout]  block until codex touches the sentinel — THE completion
+                            signal. exit 3 timeout, exit 4 pane died.
+  wait "<regex>" [timeout]  block until regex appears (default 570s); exit 3 on timeout.
+                            UNSAFE for tokens you typed yourself — see wait-done.
   wait-idle [timeout]       block until codex stops working; exit 3 on timeout
   keys <keys...>            send keys, tmux names (Escape, Enter, C-c, ...)
   focus                     reveal the codex pane in the UI (tmux/orca)
