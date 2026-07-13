@@ -1,88 +1,235 @@
 #!/usr/bin/env bash
-# codex-pane.sh — manage a Codex TUI pane in the current tmux window.
-# One codex pane per tmux window; pane id persisted so every subcommand is idempotent.
+# codex-pane.sh — manage a Codex TUI pane next to Claude, via tmux, herdr, OR orca.
+# One codex pane per tmux window / herdr tab / orca worktree; pane id persisted
+# so every subcommand is idempotent. Set LAZYCODEX_PANE_NAME to manage several
+# named panes side by side (each name gets its own state file and pane).
+#
+# Backend auto-detection: $TMUX set → tmux; $ORCA_TERMINAL_HANDLE set + orca CLI
+# present → orca; $HERDR_PANE_ID set + herdr CLI present → herdr.
+# Override with LAZYCODEX_BACKEND=tmux|herdr|orca.
 set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-warn() { echo "WARN: $*" >&2; }
 
-cmd="${1:-help}"
-shift || true
+if [ -n "${LAZYCODEX_BACKEND:-}" ]; then
+  BACKEND="$LAZYCODEX_BACKEND"
+elif [ -n "${TMUX:-}" ]; then
+  BACKEND="tmux"
+elif [ -n "${ORCA_TERMINAL_HANDLE:-}" ] && command -v orca >/dev/null 2>&1; then
+  BACKEND="orca"
+elif [ -n "${HERDR_PANE_ID:-}" ] && command -v herdr >/dev/null 2>&1; then
+  BACKEND="herdr"
+else
+  BACKEND=""   # only doctor/help may run without a backend
+fi
+case "$BACKEND" in tmux|herdr|orca|"") ;; *) die "unknown backend: $BACKEND" ;; esac
+[ "$BACKEND" = "orca" ] && ! command -v jq >/dev/null 2>&1 && die "orca backend requires jq"
 
-STATE_FILE=""
+STATE_DIR="${TMPDIR:-/tmp}/lazycodex-pane"
+mkdir -p "$STATE_DIR"
+if [ "$BACKEND" = "tmux" ]; then
+  KEY="tmux-$(tmux display-message -p '#{session_id}-#{window_id}' | tr -d '$@')"
+elif [ "$BACKEND" = "orca" ]; then
+  KEY="orca-$(printf '%s' "${ORCA_WORKTREE_ID:-w0}" | cksum | cut -d' ' -f1)"
+elif [ "$BACKEND" = "herdr" ]; then
+  KEY="herdr-$(printf '%s-%s' "${HERDR_WORKSPACE_ID:-w0}" "${HERDR_TAB_ID:-t0}" | tr -d ':')"
+else
+  KEY="none"
+fi
+STATE_FILE="$STATE_DIR/$KEY${LAZYCODEX_PANE_NAME:+-$LAZYCODEX_PANE_NAME}.pane"
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+# ---------- backend primitives ----------------------------------------------
+
+herdr_pane_id() { grep -o '"pane_id":"[^"]*"' | head -1 | cut -d'"' -f4; }
+
+orca_send() {
+  # orca_send <handle> <send-flags...>
+  local id="$1"; shift
+  orca terminal send --terminal "$id" "$@" --json >/dev/null 2>&1
 }
 
-require_tmux_session() {
-  [ -n "${TMUX:-}" ] || die "not inside tmux — this skill requires Claude to run in a tmux pane"
+herdr_key() {
+  # translate tmux key names to herdr key-combo strings
+  case "$1" in
+    Enter)  echo "enter" ;;
+    Escape) echo "esc" ;;
+    Space)  echo "space" ;;
+    Tab)    echo "tab" ;;
+    Up)     echo "up" ;;
+    Down)   echo "down" ;;
+    C-?)    echo "ctrl+$(printf '%s' "${1#C-}" | tr '[:upper:]' '[:lower:]')" ;;
+    M-?)    echo "alt+$(printf '%s' "${1#M-}" | tr '[:upper:]' '[:lower:]')" ;;
+    *)      echo "$1" ;;
+  esac
 }
 
-init_state() {
-  require_cmd tmux
-  require_tmux_session
-  local state_dir key
-  state_dir="${TMPDIR:-/tmp}/lazycodex-pane"
-  mkdir -p "$state_dir"
-  key="$(tmux display-message -p '#{session_id}-#{window_id}' | tr -d '$@')"
-  STATE_FILE="$state_dir/$key.pane"
+be_alive() {
+  case "$BACKEND" in
+    tmux) tmux list-panes -F '#{pane_id}' 2>/dev/null | grep -qx "$1" ;;
+    orca) orca terminal show --terminal "$1" --json 2>/dev/null | jq -e '.ok == true' >/dev/null 2>&1 ;;
+    *)    herdr pane get "$1" >/dev/null 2>&1 ;;
+  esac
 }
 
-pane_alive() {
-  tmux list-panes -F '#{pane_id}' 2>/dev/null | grep -qx "$1"
+be_spawn() {
+  # be_spawn "<shell command>" → create pane running command, print pane id
+  local cmd="$1" id
+  case "$BACKEND" in
+    tmux)
+      id="$(tmux split-window -h -d -c "$PWD" -P -F '#{pane_id}' "$cmd")"
+      tmux set-option -p -t "$id" remain-on-exit on
+      ;;
+    orca)
+      # new terminal tab in the current worktree, no focus steal
+      id="$(orca terminal create --worktree active --title "${LAZYCODEX_PANE_NAME:-codex}" \
+            --command "$cmd" --json 2>/dev/null | jq -r '.result.terminal.handle // empty')"
+      [ -n "$id" ] || return 1
+      ;;
+    *)
+      id="$(herdr pane split --pane "$HERDR_PANE_ID" --direction right --cwd "$PWD" --no-focus | herdr_pane_id)"
+      [ -n "$id" ] || return 1
+      sleep 0.5   # let the pane's shell come up before typing into it
+      herdr pane run "$id" "$cmd" >/dev/null
+      ;;
+  esac
+  echo "$id"
 }
+
+be_paste() {
+  # paste text into the pane's composer WITHOUT submitting
+  local id="$1" text="$2"
+  case "$BACKEND" in
+    tmux)
+      tmux load-buffer -b lazycodex - <<< "$text"
+      tmux paste-buffer -p -b lazycodex -t "$id"
+      ;;
+    orca) orca_send "$id" --text "$text" ;;
+    *)    herdr pane send-text "$id" "$text" >/dev/null ;;
+  esac
+}
+
+be_keys() {
+  local id="$1"; shift
+  case "$BACKEND" in
+    tmux) tmux send-keys -t "$id" "$@" ;;
+    orca)
+      # only the keys this skill actually uses; a bare ESC byte can swallow the
+      # next char if sent back-to-back, hence the sleep after Escape.
+      local k
+      for k in "$@"; do
+        case "$k" in
+          Enter)  orca_send "$id" --enter ;;
+          Escape) orca_send "$id" --text "$(printf '\033')"; sleep 0.3 ;;
+          C-c)    orca_send "$id" --interrupt ;;
+          Tab)    orca_send "$id" --text "$(printf '\t')" ;;
+          Space)  orca_send "$id" --text ' ' ;;
+          *)      orca_send "$id" --text "$k" ;;
+        esac
+      done
+      ;;
+    *)
+      local k; local args=()
+      for k in "$@"; do args+=("$(herdr_key "$k")"); done
+      herdr pane send-keys "$id" "${args[@]}" >/dev/null
+      ;;
+  esac
+}
+
+be_screen() {
+  # visible screen only (for readiness / busy heuristics)
+  case "$BACKEND" in
+    tmux) tmux capture-pane -p -t "$1" 2>/dev/null || true ;;
+    orca) orca terminal read --terminal "$1" --json 2>/dev/null | jq -r '.result.terminal.tail[]? // empty' || true ;;
+    *)    herdr pane read "$1" --source visible 2>/dev/null || true ;;
+  esac
+}
+
+be_capture() {
+  # be_capture <id> <lines> — last N lines including scrollback.
+  # herdr: codex's TUI renders on the alternate screen, which `recent` does not
+  # include — so append `visible` (current screen) after the scrollback.
+  case "$BACKEND" in
+    tmux) tmux capture-pane -p -t "$1" -S "-$2" 2>/dev/null || true ;;
+    orca) orca terminal read --terminal "$1" --limit "$2" --json 2>/dev/null | jq -r '.result.terminal.tail[]? // empty' || true ;;
+    *)
+      {
+        herdr pane read "$1" --source recent --lines "$2" 2>/dev/null
+        herdr pane read "$1" --source visible 2>/dev/null
+      } || true
+      ;;
+  esac
+}
+
+be_status() {
+  # BUSY | IDLE | BLOCKED (BLOCKED only detectable on herdr)
+  local id="$1" st out
+  if [ "$BACKEND" = "herdr" ]; then
+    st="$(herdr pane get "$id" 2>/dev/null | grep -o '"agent_status":"[^"]*"' | cut -d'"' -f4 || true)"
+    case "$st" in
+      working)   echo "BUSY";    return 0 ;;
+      blocked)   echo "BLOCKED"; return 0 ;;
+      idle|done) echo "IDLE";    return 0 ;;
+    esac
+    # agent_status unknown → fall through to screen heuristic
+  fi
+  if [ "$BACKEND" = "orca" ]; then
+    # dead PTY → IDLE; otherwise use orca's native TUI-idle probe (short window:
+    # ok → idle now, timeout → still working). Screen grep is unreliable here
+    # because alt-screen reads can interleave/garble the status line.
+    st="$(orca terminal show --terminal "$id" --json 2>/dev/null | jq -r '.result.terminal.status // empty')"
+    if [ -n "$st" ] && [ "$st" != "running" ]; then echo "IDLE"; return 0; fi
+    if orca terminal wait --terminal "$id" --for tui-idle --timeout-ms 1500 --json 2>/dev/null \
+        | jq -e '.ok == true' >/dev/null 2>&1; then
+      echo "IDLE"
+    else
+      echo "BUSY"
+    fi
+    return 0
+  fi
+  out="$(be_screen "$id")"
+  if echo "$out" | grep -qiE 'esc to interrupt'; then echo "BUSY"; else echo "IDLE"; fi
+}
+
+be_kill() {
+  case "$BACKEND" in
+    tmux) tmux kill-pane -t "$1" 2>/dev/null || true ;;
+    orca) orca terminal close --terminal "$1" --json >/dev/null 2>&1 || true ;;
+    *)    herdr pane close "$1" >/dev/null 2>&1 || true ;;
+  esac
+}
+
+# ---------- state ------------------------------------------------------------
 
 get_pane() {
   [ -f "$STATE_FILE" ] || return 1
   local id
   id="$(cat "$STATE_FILE")"
-  pane_alive "$id" || { rm -f "$STATE_FILE"; return 1; }
+  be_alive "$id" || { rm -f "$STATE_FILE"; return 1; }
   echo "$id"
 }
 
-submit_text() {
-  local id text
-  id="${1:?pane id required}"
-  text="${2:?text required}"
-  tmux load-buffer -b lazycodex - <<< "$text"
-  tmux paste-buffer -p -b lazycodex -t "$id"
-  sleep 0.5
-  tmux send-keys -t "$id" Enter
-}
+# ---------- subcommands -------------------------------------------------------
 
-is_busy_output() {
-  grep -qiE 'esc to interrupt|press esc to interrupt'
-}
+cmd="${1:-help}"
+shift || true
 
-wait_ready() {
-  local id out
-  id="${1:?pane id required}"
-  for _ in $(seq 1 60); do
-    out="$(tmux capture-pane -p -t "$id" 2>/dev/null || true)"
-    if echo "$out" | grep -qiE 'Context .*left|Use /skills|esc to interrupt|press esc to interrupt'; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
+case "$cmd" in
+  doctor|help|--help|-h) ;;
+  *) [ -n "$BACKEND" ] || die "not inside tmux, orca, or herdr — this skill requires Claude to run in a tmux/orca/herdr terminal" ;;
+esac
 
 case "$cmd" in
   doctor)
-    # doctor — print local readiness checks without mutating panes.
+    # doctor — print readiness checks without mutating panes.
     ok=1
-    if command -v tmux >/dev/null 2>&1; then
-      echo "PASS tmux: $(tmux -V)"
+    if [ -n "$BACKEND" ]; then
+      echo "PASS backend: $BACKEND"
+      if [ "$BACKEND" = "orca" ] && ! command -v jq >/dev/null 2>&1; then
+        echo "FAIL jq: required for the orca backend"
+        ok=0
+      fi
     else
-      echo "FAIL tmux: not found"
-      ok=0
-    fi
-
-    if [ -n "${TMUX:-}" ]; then
-      echo "PASS tmux-session: inside tmux"
-    else
-      echo "FAIL tmux-session: not inside tmux"
+      echo "FAIL backend: not inside tmux, orca, or herdr"
       ok=0
     fi
 
@@ -102,11 +249,9 @@ case "$cmd" in
       ok=0
     fi
 
-    if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
-      init_state
+    if [ -n "$BACKEND" ]; then
       if id="$(get_pane)"; then
-        echo "INFO codex-pane: $id"
-        "$0" status
+        echo "INFO codex-pane: $id ($(be_status "$id"))"
       else
         echo "INFO codex-pane: none"
       fi
@@ -114,55 +259,66 @@ case "$cmd" in
 
     [ "$ok" -eq 1 ] || exit 1
     ;;
-
   start)
     # start [initial-prompt] — create pane + launch codex; idempotent. Prints pane id.
-    init_state
-    require_cmd codex
     if id="$(get_pane)"; then echo "$id"; exit 0; fi
-    initial_prompt="${1:-}"
-    id="$(tmux split-window -h -d -c "$PWD" -P -F '#{pane_id}' "codex")"
-    tmux set-option -p -t "$id" remain-on-exit on
-    echo "$id" > "$STATE_FILE"
-    echo "$id"
-    if wait_ready "$id"; then
-      if [ -n "$initial_prompt" ]; then
-        submit_text "$id" "$initial_prompt"
-      fi
+    if [ $# -gt 0 ] && [ -n "${1:-}" ]; then
+      launch="codex $(printf '%q' "$1")"
     else
-      warn "codex ready-marker not seen after 60s; verify with: codex-pane.sh peek"
+      launch="codex"
     fi
+    id="$(be_spawn "$launch")" || die "failed to create codex pane"
+    echo "$id" > "$STATE_FILE"
+    if [ "$BACKEND" = "orca" ]; then
+      # orca detects TUI readiness natively
+      if orca terminal wait --terminal "$id" --for tui-idle --timeout-ms 60000 --json 2>/dev/null \
+          | jq -e '.ok == true' >/dev/null 2>&1; then
+        echo "$id"
+        exit 0
+      fi
+      echo "$id"
+      echo "WARN: codex not tui-idle after 60s; verify with: codex-pane.sh peek" >&2
+      exit 0
+    fi
+    for _ in $(seq 1 60); do
+      out="$(be_screen "$id")"
+      if echo "$out" | grep -qiE 'Context .*left|Use /skills|esc to interrupt'; then
+        echo "$id"
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "$id"
+    echo "WARN: codex ready-marker not seen after 60s; verify with: codex-pane.sh peek" >&2
     ;;
 
   send)
-    # send "<text>" — bracketed-paste into the composer, then submit with Enter.
-    init_state
+    # send "<text>" — paste into the composer, then submit with Enter.
     id="$(get_pane)" || die "no codex pane; run start first"
-    [ $# -gt 0 ] || die "text required"
-    submit_text "$id" "$*"
+    text="${1:?text required}"
+    be_paste "$id" "$text"
+    sleep 0.5
+    be_keys "$id" Enter
     ;;
 
   peek)
     # peek [lines] — show the last N lines of the codex pane (default 60).
-    init_state
     id="$(get_pane)" || die "no codex pane"
-    tmux capture-pane -p -t "$id" -S "-${1:-60}"
+    be_capture "$id" "${1:-60}"
     ;;
 
   status)
-    # status — BUSY (codex is working) | IDLE (composer waiting) | NO_PANE
-    init_state
+    # status — BUSY (working) | IDLE (composer waiting) | BLOCKED (herdr) | NO_PANE
     id="$(get_pane)" || { echo "NO_PANE"; exit 0; }
-    out="$(tmux capture-pane -p -t "$id" 2>/dev/null || true)"
-    if echo "$out" | is_busy_output; then echo "BUSY"; else echo "IDLE"; fi
+    be_status "$id"
     ;;
 
   wait)
     # wait "<regex>" [timeout] — block until regex appears in CODEX OUTPUT (default 570s).
-    # Lines starting with '›' (echoed user messages / composer) are excluded, so a
+    # Lines starting with '›' (echoed user messages / composer) and with 'codex '
+    # (the shell line that launched codex — visible on orca) are excluded, so a
     # done-token contained in the dispatched prompt does not self-match.
     # Exit 0 + tail on match, exit 3 on timeout.
-    init_state
     id="$(get_pane)" || die "no codex pane"
     pattern="${1:?pattern required}"
     timeout="${2:-570}"
@@ -170,8 +326,8 @@ case "$cmd" in
     elapsed=0
     out=""
     while [ "$elapsed" -lt "$timeout" ]; do
-      out="$(tmux capture-pane -p -t "$id" -S -300 2>/dev/null || true)"
-      if echo "$out" | grep -vE '^[[:space:]]*›' | grep -qE "$pattern"; then
+      out="$(be_capture "$id" 300)"
+      if echo "$out" | grep -vE '^[[:space:]]*›|^[[:space:]]*codex[[:space:]]' | grep -qE "$pattern"; then
         echo "MATCHED: $pattern"
         echo "---"
         echo "$out" | tail -40
@@ -187,24 +343,24 @@ case "$cmd" in
     ;;
 
   wait-idle)
-    # wait-idle [timeout] — block until codex stops working (3 consecutive idle checks).
-    init_state
+    # wait-idle [timeout] — block until codex stops working (3 consecutive non-busy checks).
     id="$(get_pane)" || die "no codex pane"
     timeout="${1:-570}"
     interval=5
     elapsed=0
     idle_count=0
+    st="IDLE"
     while [ "$elapsed" -lt "$timeout" ]; do
-      out="$(tmux capture-pane -p -t "$id" 2>/dev/null || true)"
-      if echo "$out" | is_busy_output; then
+      st="$(be_status "$id")"
+      if [ "$st" = "BUSY" ]; then
         idle_count=0
       else
         idle_count=$((idle_count + 1))
       fi
       if [ "$idle_count" -ge 3 ]; then
-        echo "IDLE"
+        echo "$st"
         echo "---"
-        tmux capture-pane -p -t "$id" -S -80
+        be_capture "$id" 80
         exit 0
       fi
       sleep "$interval"
@@ -215,39 +371,57 @@ case "$cmd" in
     ;;
 
   keys)
-    # keys <keys...> — raw tmux send-keys passthrough (e.g. Escape, Enter, C-c).
-    init_state
+    # keys <keys...> — send keys using tmux names (Escape, Enter, C-c, ...);
+    # translated automatically on herdr.
     id="$(get_pane)" || die "no codex pane"
-    [ $# -gt 0 ] || die "keys required"
-    tmux send-keys -t "$id" "$@"
+    be_keys "$id" "$@"
     ;;
 
   stop)
     # stop — interrupt codex and kill the pane.
-    init_state
     id="$(get_pane)" || { echo "no pane"; exit 0; }
-    tmux send-keys -t "$id" C-c
+    be_keys "$id" C-c
     sleep 0.5
-    tmux send-keys -t "$id" C-c
+    be_keys "$id" C-c
     sleep 1
-    tmux kill-pane -t "$id" 2>/dev/null || true
+    be_kill "$id"
     rm -f "$STATE_FILE"
     echo "stopped"
     ;;
 
+  focus)
+    # focus — reveal the codex pane in the UI (orca/tmux; no-op on herdr).
+    id="$(get_pane)" || die "no codex pane"
+    case "$BACKEND" in
+      tmux) tmux select-pane -t "$id" ;;
+      orca) orca terminal switch --terminal "$id" --json >/dev/null 2>&1 ;;
+      *)    echo "focus not supported on herdr" >&2 ;;
+    esac
+    ;;
+
+  backend)
+    # backend — print which backend is active (tmux | herdr | orca).
+    echo "$BACKEND"
+    ;;
+
   *)
     cat <<'EOF'
-usage: codex-pane.sh <subcommand>
-  doctor                    check tmux, codex, LazyCodex config, and pane state
+usage: codex-pane.sh <subcommand>          (backend: tmux, herdr, or orca — auto-detected)
   start [prompt]            create pane + launch codex (idempotent); prints pane id.
-                            optional prompt is submitted after codex is ready.
+                            optional prompt is submitted on launch.
+  doctor                    readiness checks (backend, codex CLI, LazyCodex plugin)
   send "<text>"             paste text into codex composer and submit
   peek [lines]              show last N lines of the pane (default 60)
-  status                    BUSY | IDLE | NO_PANE
+  status                    BUSY | IDLE | BLOCKED (herdr only) | NO_PANE
   wait "<regex>" [timeout]  block until regex appears (default 570s); exit 3 on timeout
   wait-idle [timeout]       block until codex stops working; exit 3 on timeout
-  keys <keys...>            raw tmux send-keys (Escape, Enter, C-c, ...)
+  keys <keys...>            send keys, tmux names (Escape, Enter, C-c, ...)
+  focus                     reveal the codex pane in the UI (tmux/orca)
   stop                      interrupt codex and kill the pane
+  backend                   print active backend (tmux | herdr | orca)
+
+env: LAZYCODEX_BACKEND=tmux|herdr|orca overrides detection.
+     LAZYCODEX_PANE_NAME=<name> manages a separate named pane (multi-worker).
 EOF
     ;;
 esac
