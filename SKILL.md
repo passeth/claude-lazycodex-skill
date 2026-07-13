@@ -103,37 +103,82 @@ Loop protocol:
 
 Backend is orca AND the work splits into 2+ independent parts → skip `$teammode`
 and use orca's native orchestration: one codex terminal per part, tracked
-task/dispatch lifecycle, `worker_done` as the done signal (no completion-promise
-tokens needed). Keep it to 3–4 workers; deeper DAGs aren't worth coordinating.
+task/dispatch lifecycle, `worker_done` as the done signal. Each worker still runs
+the LazyCodex harness inside its own dispatch, so you get harness autonomy *and*
+deterministic completion. Keep it to 3–4 workers; deeper DAGs aren't worth
+coordinating. Workers must not share files — split by ownership, or give truly
+independent work its own worktree.
 
 ```bash
 # 0) state check
 orca status --json && orca worktree ps --json && orca terminal list --json
 
-# 1) one worker per part — same worktree (shares uncommitted state):
-orca terminal create --worktree active --title "worker-<part>" --command "codex" --json   # → .result.terminal.handle
+# 1) one worker per part — same worktree (shares uncommitted state).
+#    ALWAYS launch workers with MCP off: codex's app-server inherits launchd's
+#    256-fd limit, and each stdio MCP server holds pipes against it. A few parallel
+#    MCP-laden workers wedge the shared app-server with "Too many open files
+#    (os error 24)" — which silently kills the run (see the warning below).
+orca terminal create --worktree active --title "worker-<part>" \
+  --command "codex -c 'mcp_servers={}'" --json          # → .result.terminal.handle
 #    OR isolated checkout (only for truly independent work; no uncommitted deps):
-orca worktree create --name <part> --agent codex --json                                    # → .result.startupTerminal.handle
-orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
+orca worktree create --name <part> --agent codex --json  # → .result.startupTerminal.handle
 
-# 2) task + dispatch (--inject sends spec + lifecycle preamble into codex)
+# 2) readiness gate — tui-idle alone is NOT enough (see below)
+orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
+orca terminal show --terminal <handle> --json | jq -r '.result.terminal.preview'
+#    Composer ready → preview contains "Context ... left" / "esc to interrupt" / "/model to change".
+#    Login screen  → preview contains "Sign in" / "device code" / "code_challenge": DO NOT dispatch.
+#    Neither yet   → codex is still painting; re-poll every 3s (takes ~2 polls in practice).
+
+# 3) task + dispatch (--inject sends spec + lifecycle preamble into codex)
 orca orchestration task-create --spec "<self-contained brief>" --task-title "<short>" --json  # → task id
 orca orchestration dispatch --task <task_id> --to <handle> --inject --json
 
-# 3) supervision loop — one message per call; loop once per outstanding worker
+# 4) confirm the worker actually took the task before you start waiting
+orca terminal read --terminal <handle> --limit 80 --json   # expect the spec echoed + "Working"
+
+# 5) supervision loop — one message per call; loop once per outstanding worker
 orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 570000 --json
 ```
+
+**`tui-idle` lies about readiness.** It returns `ok=true` on codex's *login screen* too. Dispatch
+then types the whole spec into a sign-in prompt, it vanishes, and the coordinator waits forever for
+a `worker_done` that can never come. Always run the readiness gate above, and always confirm receipt
+(step 4) before entering the wait loop. A dispatch the worker never saw looks exactly like a slow
+worker.
 
 Rules (mirror orca's official orchestration conventions):
 
 - Write each `--spec` self-contained in English, like a `send` dispatch prompt: task,
   file paths, constraints ("pnpm only", "must pass pnpm build"), evidence of done.
-  Plain English — do NOT put `$ulw-loop`/harness commands inside a spec; the injected
-  preamble already owns the worker lifecycle. Harness commands stay for single-pane mode.
+- **Put the harness *inside* the spec** — this is the whole point of using this skill
+  instead of bare orca orchestration. Structure each spec as two steps:
+
+  ```
+  Step 1 - run exactly this harness command in your composer:
+  $ulw-loop "<the actual task>" --completion-promise="LCX_DONE_<SLUG>"
+
+  Step 2 - once the harness prints LCX_DONE_<SLUG>, send worker_done exactly as your
+  dispatch preamble instructs, with reportPath=<path>.
+  ```
+
+  The harness loop and the dispatch lifecycle do **not** conflict: `$ulw-loop` runs to its
+  own completion promise, and only then does the worker report. Verified end-to-end — the
+  worker ran the loop, hit its promise token, wrote its report, and issued a correct
+  `worker_done` (matching taskId/dispatchId/coordinator handle).
 - Run `check --wait` with `run_in_background: true` (keep `--timeout-ms` ≤ 570000,
   under the Bash timeout). A timeout or `{count:0}` is a checkpoint, NOT a failure —
   coding tasks run 15–60 min. Liveness-check with `orca terminal read`/`tui-idle`,
   then wait again. Never kill a worker just because it hasn't reported yet.
+- **Known gap: `worker_done` sent from inside codex can go missing.** Observed once — the
+  worker ran `orca orchestration send` as a tool call, the CLI returned a message id, but
+  the message never reached the coordinator's inbox and the task stayed `dispatched`. The
+  same send from a plain shell terminal arrives instantly, so delivery itself is fine;
+  something about codex's sandboxed tool shell drops it. Root cause unconfirmed. Therefore:
+  **never treat a missing `worker_done` as a missing result.** When a wait window closes,
+  read the worker's terminal — if it shows the completion promise and a "Sent msg_..." line,
+  the work is done; take the report from disk (`reportPath`) and close the task yourself
+  with `orca orchestration task-update --id <task_id> --status completed`.
 - `decision_gate`/`ask` messages: answer with
   `orca orchestration reply --id <msg_id> --body '<answer>' --json`, then keep waiting.
   Decisions you can make from repo context, make; genuine user decisions, surface.
@@ -143,6 +188,14 @@ Rules (mirror orca's official orchestration conventions):
   `orca terminal send --terminal <handle> --text '<fix instruction>' --enter --json`.
 - Workers created here are yours to close; never `terminal close` handles you didn't
   create. Leave them open after the run unless the user asks to clean up.
+- **A silent worker is not a slow worker.** `worker_done` is itself a shell command the
+  worker must spawn (`orca orchestration send`), so a worker whose tool execution is
+  broken can never report — the coordinator just sees `check --wait` time out forever.
+  Before treating a timeout as "still working", confirm the worker is actually alive:
+  `orca terminal read --terminal <handle>` and look for real progress, not just a
+  spinner. `Too many open files (os error 24)` in a worker means the codex app-server
+  hit its 256-fd ceiling: stop dispatching, and see the MCP note above. When workers
+  die that way, close them — leaving them retrying only burns more descriptors.
 - Single-pane orca runs (one codex, `$ulw-loop` + completion promise) still go through
   `$PANE` — this section is only for parallel fan-out.
 

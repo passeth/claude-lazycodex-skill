@@ -262,10 +262,14 @@ case "$cmd" in
   start)
     # start [initial-prompt] — create pane + launch codex; idempotent. Prints pane id.
     if id="$(get_pane)"; then echo "$id"; exit 0; fi
+    # LAZYCODEX_CODEX_ARGS injects codex flags, e.g. -c 'mcp_servers={}' to launch
+    # without MCP servers (each stdio MCP holds pipes against the codex app-server's
+    # 256-fd launchd limit; a heavy MCP config wedges it with EMFILE).
+    codex_cmd="codex${LAZYCODEX_CODEX_ARGS:+ $LAZYCODEX_CODEX_ARGS}"
     if [ $# -gt 0 ] && [ -n "${1:-}" ]; then
-      launch="codex $(printf '%q' "$1")"
+      launch="$codex_cmd $(printf '%q' "$1")"
     else
-      launch="codex"
+      launch="$codex_cmd"
     fi
     id="$(be_spawn "$launch")" || die "failed to create codex pane"
     echo "$id" > "$STATE_FILE"

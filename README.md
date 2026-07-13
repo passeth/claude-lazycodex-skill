@@ -30,6 +30,35 @@ Orca IDE에서는 여기에 더해 **A2A 멀티 워커 모드**를 지원합니�
 - 그래서 **Claude를 위에 얹어** 방향을 잡고, 결과를 검증하게 했습니다.
 - 별도 프로그램 없이 **터미널 화면 한 칸**으로 두 모델이 협업합니다.
 
+## 언제 쓰나요? (그리고 언제 안 써도 되나요)
+
+이 스킬의 본질은 **Claude에게 LazyCodex 사용법을 가르치는 것**입니다. 터미널을 띄우는 건
+tmux든 Orca든 원래 되는 일이지만, **어떤 하네스 명령을 골라야 하는지, 완료 토큰을 어떻게
+잡아야 하는지, "다 됐다"를 어떻게 검증해야 하는지**는 Claude가 기본적으로 모릅니다.
+그 지식이 `SKILL.md`에 들어 있습니다.
+
+| 이런 상황 | 쓸 것 |
+|---|---|
+| Codex한테 짧은 질문 하나, 리뷰 한 번 | ❌ 이 스킬 아님 — 가벼운 `/codex` 계열을 쓰세요 |
+| 코드를 실제로 짜야 하고, 될 때까지 자율로 돌리고 싶다 | ✅ **이 스킬** — 단일 pane + `$ulw-loop` (가장 흔한 경우) |
+| 큰 기능이라 계획부터 세워야 한다 | ✅ **이 스킬** — `$ulw-plan` → 계획 검토 → `$start-work` |
+| 갈래가 2~4개, 파일이 안 겹친다 (Orca) | ✅ **이 스킬의 A2A 모드** — 워커마다 하네스를 돌립니다 |
+| 그냥 다른 에이전트에게 일을 넘기고 손 떼고 싶다 | ❌ Orca의 `orca-cli` 핸드오프를 쓰세요 |
+| 하네스 없이 순수 codex 워커만 조율하면 된다 | ❌ Orca의 `orchestration` 스킬만으로 충분합니다 |
+
+**Orca 자체 기능과의 관계.** Orca에는 이미 `orca-cli`(터미널·워크트리 제어)와
+`orchestration`(작업 배정·`worker_done` 수거)이 있습니다. 그것들만으로도 codex 워커를 띄우고
+조율할 수 있습니다 — **다만 그 워커는 "맨 codex"입니다.** 이 스킬은 그 위에 얹혀서,
+Claude가 워커에게 **LazyCodex 하네스를 제대로 물려주도록** 만듭니다:
+
+- 작업 성격에 맞는 하네스 명령 선택 (`$ulw-plan` / `$start-work` / `$ulw-loop`)
+- `--completion-promise` 토큰 규칙 (30자 미만 — 넘으면 TUI에서 줄바꿈돼 감지 실패)
+- `$` 접두사가 스킬 피커를 띄워 입력을 삼킬 때의 복구
+- Codex의 "완료" 선언을 믿지 않고 Claude가 직접 빌드·테스트로 검증하는 경계
+
+즉 **Orca = 배선, 이 스킬 = 하네스 운용법 + 검증 규율**입니다. 둘은 경쟁 관계가 아니라
+층이 다르며, A2A 모드에서는 실제로 Orca의 오케스트레이션 위에서 하네스가 돌아갑니다.
+
 ## 준비물
 
 1. **Claude Code**를 지원 환경 안에서 실행 (스킬이 옆 칸을 띄우기 때문):
@@ -93,28 +122,56 @@ chmod +x ~/.claude/skills/lazycodex/scripts/codex-pane.sh
 
 ## Orca IDE: A2A 멀티 워커 모드
 
-Orca에서 작업이 독립적인 2개 이상의 갈래로 나뉘면, Claude는 `$teammode`(Codex 한 프로세스가
-멤버를 저글링) 대신 **진짜 병렬 Codex 터미널**을 띄웁니다. Orca의 네이티브 오케스트레이션이
-작업 배정과 완료 보고를 추적합니다:
+Orca에서 작업이 독립적인 2~4개 갈래로 나뉘면, Claude는 `$teammode`(Codex 한 프로세스가
+멤버를 저글링) 대신 **진짜 병렬 Codex 터미널**을 띄웁니다. 그리고 **각 워커 안에서 LazyCodex
+하네스가 돕니다** — 하네스의 자율성과 Orca의 확실한 완료 추적을 둘 다 가져갑니다.
 
 ```bash
-# 갈래마다 워커 터미널 하나 (현재 워크트리 공유)
-orca terminal create --worktree active --title "worker-api" --command "codex" --json
-orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
+# 1) 갈래마다 워커 터미널 하나 (MCP는 끄고 — 아래 주의사항 참고)
+orca terminal create --worktree active --title "worker-api" \
+  --command "codex -c 'mcp_servers={}'" --json
 
-# 작업 생성 + 배정 (--inject 가 작업 지시문과 라이프사이클 프리앰블을 codex에 주입)
-orca orchestration task-create --spec "<자기완결적 작업 지시문>" --json
+# 2) 준비 확인 — tui-idle만으로는 부족합니다 (아래 주의사항 참고)
+orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
+orca terminal show --terminal <handle> --json | jq -r '.result.terminal.preview'
+#    "Context ... left" 가 보이면 준비됨 / "Sign in" 이 보이면 로그인 화면 → 디스패치 금지
+
+# 3) 작업 생성 + 배정 — spec 안에 하네스 명령을 넣습니다
+orca orchestration task-create --spec 'Step 1 - run exactly this in your composer:
+$ulw-loop "<실제 작업>" --completion-promise="LCX_DONE_API"
+
+Step 2 - once the harness prints LCX_DONE_API, send worker_done as your preamble instructs.' --json
 orca orchestration dispatch --task <task_id> --to <handle> --inject --json
 
-# 수거 루프 — 워커가 끝나면 worker_done, 막히면 escalation/decision_gate 메시지가 옴
+# 4) 수거 루프
 orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 570000 --json
 ```
 
-- 완료 신호가 텍스트 토큰이 아니라 **`worker_done` 메시지**라서 감지가 확실합니다.
+**하네스와 `worker_done`은 충돌하지 않습니다** (실측 검증). `$ulw-loop`가 자기 완료 약속에
+도달해 끝난 *뒤에* 워커가 완료 보고를 하는 순차 구조라, 루프가 중첩되지 않습니다.
+
 - 워커가 질문하면(`decision_gate`) Claude가 `orca orchestration reply`로 답합니다.
-- `worker_done`이 와도 Claude가 **직접 검증**한 뒤에만 수락합니다 (기존 검증 원칙 동일).
-- 독립된 체크아웃이 필요하면 `orca worktree create --name <part> --agent codex --json` 으로
-  워크트리 단위 워커도 만들 수 있습니다.
+- `worker_done`이 와도 Claude가 **직접 검증**한 뒤에만 수락합니다 (검증 원칙은 동일).
+- 독립된 체크아웃이 필요하면 `orca worktree create --name <part> --agent codex --json`.
+- 워커끼리 **같은 파일을 건드리지 않게** 갈래를 나누세요. 한 프로세스인 `$teammode`와 달리
+  진짜 병렬이라 파일 충돌은 조율자 책임입니다.
+
+### 실전에서 물린 것들 (Orca 한정)
+
+- **MCP를 끄고 워커를 띄우세요.** Codex의 app-server는 launchd 기본값인 **fd 256개** 제한을
+  물려받는데, stdio MCP 서버 하나하나가 파이프를 물고 있습니다. MCP를 잔뜩 문 워커를 몇 개
+  병렬로 띄우면 app-server가 `Too many open files (os error 24)`로 고착되고, **codex 전체가
+  안 뜹니다.** 복구는 app-server 프로세스를 죽이면 됩니다(다음 실행 때 자동 재생성).
+- **`tui-idle`은 준비 상태를 보장하지 않습니다.** Codex의 **로그인 화면에서도 `ok=true`** 를
+  반환합니다. 그 상태로 디스패치하면 작업 지시문이 로그인 프롬프트에 타이핑되고 증발하며,
+  조율자는 오지 않을 `worker_done`을 영원히 기다립니다. 반드시 preview로 컴포저를 확인하세요.
+- **조용한 워커 ≠ 느린 워커.** `worker_done`은 워커가 셸 명령을 띄워야 보낼 수 있어서, 워커의
+  도구 실행이 깨지면 완료 신호가 영영 안 옵니다. 타임아웃을 "아직 일하는 중"으로 넘기지 말고
+  터미널을 실제로 읽어 확인하세요.
+- **알려진 미해결 이슈**: codex 내부에서 보낸 `worker_done`이 조율자 수신함에 도달하지 않는
+  경우를 한 번 관측했습니다(CLI는 메시지 ID를 반환). 일반 셸에서 보낸 메시지는 정상 도착하므로
+  배달 자체는 멀쩡합니다. 원인 미확정이라, **완료 메시지가 없다고 결과가 없는 게 아닙니다** —
+  워커 터미널에 완료 토큰이 찍혔는지 확인하고 리포트 파일을 직접 거두세요.
 
 ## 안에 뭐가 들어있나요?
 

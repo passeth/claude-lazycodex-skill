@@ -122,22 +122,40 @@ If `wait` times out:
 
 On the orca backend, parallel fan-out should use Orca's native orchestration
 layer instead of `$teammode` — real parallel codex terminals with a tracked
-task/dispatch lifecycle. The done signal is a `worker_done` message, not a
-completion-promise token. See the "Orca A2A multi-worker mode" section of
-`SKILL.md` for the full flow:
+task/dispatch lifecycle, each running the LazyCodex harness inside its dispatch.
+See the "Orca A2A multi-worker mode" section of `SKILL.md` for the full flow:
 
 ```bash
-orca terminal create --worktree active --title "worker-<part>" --command "codex" --json
+orca terminal create --worktree active --title "worker-<part>" \
+  --command "codex -c 'mcp_servers={}'" --json
 orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
-orca orchestration task-create --spec "<self-contained brief>" --json
+orca terminal show --terminal <handle> --json | jq -r '.result.terminal.preview'  # composer? login?
+orca orchestration task-create --spec "<harness-in-spec brief>" --json
 orca orchestration dispatch --task <task_id> --to <handle> --inject --json
 orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 570000 --json
 ```
 
-Key rules: specs are plain English (no harness commands — the injected preamble
-owns the worker lifecycle), a `check --wait` timeout is a checkpoint not a
-failure, answer `decision_gate` messages with `orca orchestration reply`, and
-verify every `worker_done` yourself before accepting it.
+Key rules:
+
+- **Put the harness inside the spec.** `$ulw-loop "<task>" --completion-promise=<TOKEN>`
+  as step 1, `worker_done` as step 2. The harness loop and the dispatch lifecycle run
+  sequentially, not nested — verified end-to-end.
+- Launch workers with MCP off. Codex's app-server inherits launchd's 256-fd limit and
+  each stdio MCP holds pipes against it; MCP-laden parallel workers wedge it with
+  `Too many open files (os error 24)`, which takes down codex entirely. Recover by
+  killing the app-server process (it respawns on the next codex launch).
+- `tui-idle` returns `ok=true` on codex's **login screen** too. Always confirm the
+  composer via `terminal show`'s preview before dispatching, and confirm the worker
+  echoed the spec before entering the wait loop.
+- A `check --wait` timeout is a checkpoint, not a failure. But a silent worker is not
+  necessarily a slow worker — `worker_done` is itself a spawned shell command, so a
+  worker whose tool execution is broken can never report. Read the terminal.
+- Known gap: a `worker_done` sent from inside codex has been observed to go missing
+  (CLI returns a message id; the coordinator's inbox stays empty). The same send from a
+  plain shell arrives fine, so delivery works — root cause unconfirmed. Never equate a
+  missing completion message with a missing result; check the terminal and the report file.
+- Answer `decision_gate` messages with `orca orchestration reply`, and verify every
+  `worker_done` yourself before accepting it.
 
 ## Verification Boundary
 
