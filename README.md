@@ -173,6 +173,45 @@ orca orchestration check --wait --types worker_done,escalation,decision_gate --t
   배달 자체는 멀쩡합니다. 원인 미확정이라, **완료 메시지가 없다고 결과가 없는 게 아닙니다** —
   워커 터미널에 완료 토큰이 찍혔는지 확인하고 리포트 파일을 직접 거두세요.
 
+## 멀티모델 팬: 워커마다 다른 두뇌 (opencodex)
+
+팬마다 **다른 모델**을 태울 수 있습니다 — 설계는 강한 모델, 기계적 구현은 싼 모델,
+리뷰는 다른 계열 모델. OpenAI 모델끼리는 `-m`만으로 되고, 비-OpenAI 모델(Kimi, DeepSeek 등)은
+[opencodex](https://github.com/lidge-jun/opencodex) 프록시가 **필수**입니다:
+codex 0.146부터 `wire_api = "chat"`이 제거되어 Responses API만 지원하는데, 대부분의
+서드파티 API는 `/v1/responses`가 없기 때문입니다 (Moonshot 404 실측).
+
+```bash
+# 설치 (한 번): 프로바이더 추가 후 restart는 필수입니다 — 안 하면 조용히 OpenAI로 샙니다
+npm i -g @bitkyc08/opencodex && ocx start
+ocx provider add moonshot --api-key "$MOONSHOT_API_KEY" && ocx restart && ocx sync
+
+# 워커마다 모델 지정 — LAZYCODEX_CODEX_ARGS로 주입
+LAZYCODEX_PANE_NAME=worker-arch LAZYCODEX_CODEX_ARGS="-m gpt-5.5 -c mcp_servers={}" \
+  codex-pane.sh start "..."
+LAZYCODEX_PANE_NAME=worker-impl LAZYCODEX_CODEX_ARGS="-m moonshot/kimi-k3 -c mcp_servers={}" \
+  codex-pane.sh start "..."
+```
+
+### 실전에서 물린 것들 (멀티모델 한정)
+
+- **디스패치 전 `ocx health` 확인.** 프록시가 죽으면 라우팅된 팬 전부가 한꺼번에 죽는
+  단일 장애점입니다. 팬이 살아있는 동안 `ocx stop`은 절대 금지 — codex 설정을 원복시켜
+  발밑을 빼버립니다.
+- **Orca는 `~/.codex/config.toml`을 계정 홈으로 복사**하면서 프록시 주입을 지웁니다.
+  주입은 양쪽 모두: `env -u CODEX_HOME ocx sync` (원본) + `ocx sync` (계정 홈).
+  라우팅이 이상하면 두 config에서 `openai_base_url`부터 grep 하세요.
+- **`ocx sync --restart-codex`는 머신의 모든 codex app-server를 죽입니다** (ChatGPT.app
+  포함). 다른 세션에 라이브 런이 있는지 확인하고 쓰세요.
+- **라우팅 검증은 `ocx observe logs`.** `moonshot/kimi-k3`처럼 프로바이더 접두어가 찍히면
+  정상, `openai/moonshot/kimi-k3`처럼 openai 뒤에 붙어 나오면 패스스루로 새는 중입니다.
+  프로바이더 쪽 429/400이 찍혔다면 라우팅은 성공이고 문제는 업스트림(쿼터/과금)입니다.
+- **deprecated 모델은 로스터에 넣지 마세요.** 시작 시 전환 다이얼로그가 떠서 디스패치한
+  프롬프트를 삼킵니다. 그리고 orca 백엔드의 `keys`는 Enter/Escape/C-c/Tab/Space만
+  매핑하므로, 다이얼로그는 화살표가 아니라 **숫자 텍스트 + Enter**로 조작해야 합니다.
+
+전체 절차와 세부 규칙은 `SKILL.md`의 "Multi-model panes (opencodex)" 섹션에 있습니다.
+
 ## 안에 뭐가 들어있나요?
 
 - **`SKILL.md`** — Claude가 따르는 지휘 절차 (이 파일이 스킬의 두뇌)

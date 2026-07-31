@@ -1,6 +1,6 @@
 ---
 name: lazycodex
-description: "Run Codex with the LazyCodex harness ($ulw-plan, $start-work, $ulw-loop, $teammode) in a tmux, herdr, or Orca IDE pane inside the CURRENT session and window, while Claude orchestrates: dispatch the task, monitor progress, answer Codex's questions, verify the result. In Orca, also supports multi-worker A2A via orca orchestration (task dispatch + worker_done). Use when the user says: lazycodex, codex pane, codex한테 시켜, codex로 돌려, ulw-loop, teammode로, codex 하네스, tmux에서 codex, herdr에서 codex, orca에서 codex, orca 워커, a2a로 돌려. NOT for quick codex consultations or reviews — use the /codex skill for those."
+description: "Run Codex with the LazyCodex harness ($ulw-plan, $start-work, $ulw-loop, $teammode) in a tmux, herdr, or Orca IDE pane inside the CURRENT session and window, while Claude orchestrates: dispatch the task, monitor progress, answer Codex's questions, verify the result. In Orca, also supports multi-worker A2A via orca orchestration (task dispatch + worker_done). Use when the user says: lazycodex, codex pane, codex한테 시켜, codex로 돌려, ulw-loop, teammode로, codex 하네스, tmux에서 codex, herdr에서 codex, orca에서 codex, orca 워커, a2a로 돌려, and for multi-model pane rosters via the opencodex proxy: 멀티모델, kimi로 돌려, 팬마다 다른 모델, opencodex. NOT for quick codex consultations or reviews — use the /codex skill for those."
 ---
 
 # LazyCodex Orchestration
@@ -144,6 +144,65 @@ writing*, and the human's newest decision silently loses.
   (`orca worktree create --name <slug> --agent codex --json`). Then codex writes to its
   own tree, and a bad completion signal degrades to "I read a stale diff" instead of two
   writers silently clobbering each other.
+
+## Multi-model panes (opencodex)
+
+Panes can run **different models per worker** — design on a strong model, mechanical
+work on a cheap one, review on a different family. Codex ≥0.146 removed
+`wire_api = "chat"`, so non-OpenAI providers (Kimi, DeepSeek, xAI, …) **require the
+[opencodex](https://github.com/lidge-jun/opencodex) proxy** (`ocx`) to translate the
+Responses API — native `model_providers` config no longer works for them (verified:
+Moonshot has no `/v1/responses`, and a `wire_api = "chat"` entry makes codex refuse to
+load its config at all). Mixing at the *pane* level also sidesteps opencodex's known
+in-codex cross-model delegation bug (opencodex#92).
+
+Per-pane model pinning (verified end-to-end with sentinel completion):
+
+```bash
+LAZYCODEX_PANE_NAME=worker-arch LAZYCODEX_CODEX_ARGS="-m gpt-5.5 -c mcp_servers={}" \
+  $PANE start "\$ulw-loop ... touch <sentinel-a>"
+LAZYCODEX_PANE_NAME=worker-impl LAZYCODEX_CODEX_ARGS="-m moonshot/kimi-k3 -c mcp_servers={}" \
+  $PANE start "\$ulw-loop ... touch <sentinel-b>"
+```
+
+Setup (once): `npm i -g @bitkyc08/opencodex` → `ocx start` → `ocx provider add <name>
+--api-key ...` → **`ocx restart`** → `ocx sync`. The restart is not optional: a running
+proxy does not load a newly added provider into memory, and requests then silently
+pass through to OpenAI as `openai/<provider>/<model>` (visible in `ocx observe logs`,
+which is also how you verify routing: correct entries look like `<provider>/<model>`).
+
+Hard-won rules:
+
+- **Preflight**: `ocx health` must be ok before dispatching any routed pane. Proxy down
+  = every routed pane fails at once; it is a shared single point of failure.
+- **Never `ocx stop` while panes are live** — it restores native codex config out from
+  under them. Treat it like editing the shared tree.
+- **Orca rewrites its codex config from `~/.codex/config.toml`.** Orca copies that file
+  into its per-account `CODEX_HOME` (`~/Library/Application Support/orca/codex-accounts/
+  <id>/home/`) when creating terminals, silently erasing the proxy injection. Inject
+  BOTH: `env -u CODEX_HOME ocx sync` (the source orca copies) and `ocx sync` (the live
+  account home). After any routing failure, `grep openai_base_url` both configs first.
+- **`ocx sync --restart-codex` SIGTERMs every codex app-server on the machine** — all
+  homes, including ChatGPT.app's. Check for live runs (`ps -o %cpu -p <pids>`) before
+  using it; idle app-servers respawn harmlessly on next launch.
+- **Roster only non-deprecated models.** A deprecated `-m` model (e.g. gpt-5.4-mini)
+  triggers a blocking switch dialog at startup that eats the dispatched prompt.
+- **Provider add can be lost** (config.json observed rewritten once). After add, confirm
+  with `jq '.providers|keys' ~/.opencodex/config.json` and `ocx provider test <name>`.
+- A provider-side 429/400 shows up in `ocx observe logs` with the provider prefix — that
+  means routing worked and the problem is upstream (quota, billing, budget caps).
+- `-c mcp_servers={}` clears only top-level MCP servers; plugin-scoped ones
+  (`[plugins."...".mcp_servers.*]`) still start. The fd-exhaustion warning below stands.
+
+### Orca pane input quirks (any model)
+
+`$PANE keys` on the orca backend maps ONLY `Enter`, `Escape`, `C-c`, `Tab`, `Space` —
+anything else (`Down`, `BSpace`, …) is sent as literal text into the composer. So:
+
+- Answer codex dialogs (model switch, hooks trust) by sending the option **digit** as
+  text then `Enter`, never arrow keys.
+- Never use `Escape` to "clear the composer" while codex is working — it interrupts the
+  turn and pauses the harness goal (recover with `$PANE send '/goal resume'`).
 
 ## Orca A2A multi-worker mode
 
