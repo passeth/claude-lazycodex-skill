@@ -195,9 +195,10 @@ LAZYCODEX_PANE_NAME=worker-impl LAZYCODEX_CODEX_ARGS="-m moonshot/kimi-k3 -c mcp
 
 ### 실전에서 물린 것들 (멀티모델 한정)
 
-- **디스패치 전 `ocx health` 확인.** 프록시가 죽으면 라우팅된 팬 전부가 한꺼번에 죽는
-  단일 장애점입니다. 팬이 살아있는 동안 `ocx stop`은 절대 금지 — codex 설정을 원복시켜
-  발밑을 빼버립니다.
+- **프록시는 자동으로 살아납니다.** `start`가 라우팅 모델 또는 주입된 config를 감지하면
+  죽은 프록시를 알아서 띄웁니다 (`ocx ensure` + 헬스 폴링, 최후엔 detached `ocx start`).
+  다만 프록시는 라우팅된 팬 전부가 공유하는 단일 장애점이고, 팬이 살아있는 동안
+  `ocx stop`은 절대 금지 — codex 설정을 원복시켜 발밑을 빼버립니다.
 - **Orca는 `~/.codex/config.toml`을 계정 홈으로 복사**하면서 프록시 주입을 지웁니다.
   주입은 양쪽 모두: `env -u CODEX_HOME ocx sync` (원본) + `ocx sync` (계정 홈).
   라우팅이 이상하면 두 config에서 `openai_base_url`부터 grep 하세요.

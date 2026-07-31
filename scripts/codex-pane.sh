@@ -142,6 +142,30 @@ be_keys() {
   esac
 }
 
+ensure_proxy() {
+  # A live opencodex proxy is required when the pane pins a routed model
+  # (-m provider/model) or the codex config routes through the proxy
+  # (openai_base_url injection) — a dead proxy then fails every request.
+  command -v ocx >/dev/null 2>&1 || return 0
+  ocx health >/dev/null 2>&1 && return 0
+  echo "opencodex proxy down — starting (ocx ensure)…" >&2
+  # cold-start can exit unhealthy while the daemon is still warming up, so
+  # poll health instead of trusting the exit code (measured: ~8s warm-up).
+  ocx ensure >/dev/null 2>&1 || true
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    ocx health >/dev/null 2>&1 && { echo "opencodex proxy up" >&2; return 0; }
+    sleep 1
+  done
+  # last resort: ocx start runs in the foreground by design, so detach it.
+  (nohup ocx start >/dev/null 2>&1 &)
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    ocx health >/dev/null 2>&1 && { echo "opencodex proxy up" >&2; return 0; }
+    sleep 1
+  done
+  die "opencodex proxy failed to start — run 'ocx start' manually, or 'ocx restore' to detach codex from the proxy"
+}
+
 be_screen() {
   # visible screen only (for readiness / busy heuristics)
   case "$BACKEND" in
@@ -307,6 +331,12 @@ case "$cmd" in
   start)
     # start [initial-prompt] — create pane + launch codex; idempotent. Prints pane id.
     if id="$(get_pane)"; then echo "$id"; exit 0; fi
+    # auto-start the opencodex proxy when this pane needs it
+    case " ${LAZYCODEX_CODEX_ARGS:-}" in
+      *" -m "*/*) ensure_proxy ;;   # routed model (provider/model) requested
+      *) grep -q '^openai_base_url' "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null \
+           && ensure_proxy ;;       # config already routes through the proxy
+    esac
     # LAZYCODEX_CODEX_ARGS injects codex flags, e.g. -c 'mcp_servers={}' to launch
     # without MCP servers (each stdio MCP holds pipes against the codex app-server's
     # 256-fd launchd limit; a heavy MCP config wedges it with EMFILE).

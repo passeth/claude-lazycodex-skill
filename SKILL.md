@@ -173,8 +173,11 @@ which is also how you verify routing: correct entries look like `<provider>/<mod
 
 Hard-won rules:
 
-- **Preflight**: `ocx health` must be ok before dispatching any routed pane. Proxy down
-  = every routed pane fails at once; it is a shared single point of failure.
+- **Preflight**: `$PANE start` auto-starts a dead proxy (`ocx ensure` + health polling,
+  detached `ocx start` as fallback) whenever the pane pins a routed model or the config
+  is proxy-injected — no manual `ocx start` needed. It still pays to know the proxy is a
+  shared single point of failure: if it dies mid-run, every routed pane fails at once,
+  and `doctor` reports the exact state.
 - **Never `ocx stop` while panes are live** — it restores native codex config out from
   under them. Treat it like editing the shared tree.
 - **Orca rewrites its codex config from `~/.codex/config.toml`.** Orca copies that file
