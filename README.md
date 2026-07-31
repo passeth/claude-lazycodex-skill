@@ -207,8 +207,8 @@ LAZYCODEX_PANE_NAME=worker-impl LAZYCODEX_CODEX_ARGS="-m moonshot/kimi-k3 -c mcp
   정상, `openai/moonshot/kimi-k3`처럼 openai 뒤에 붙어 나오면 패스스루로 새는 중입니다.
   프로바이더 쪽 429/400이 찍혔다면 라우팅은 성공이고 문제는 업스트림(쿼터/과금)입니다.
 - **deprecated 모델은 로스터에 넣지 마세요.** 시작 시 전환 다이얼로그가 떠서 디스패치한
-  프롬프트를 삼킵니다. 그리고 orca 백엔드의 `keys`는 Enter/Escape/C-c/Tab/Space만
-  매핑하므로, 다이얼로그는 화살표가 아니라 **숫자 텍스트 + Enter**로 조작해야 합니다.
+  프롬프트를 삼킵니다. 다이얼로그 조작은 **숫자 텍스트 + Enter**가 가장 안전합니다
+  (orca 백엔드 `keys`에 화살표/BSpace 매핑이 추가됐지만, 숫자는 매핑 공백과 무관합니다).
 
 전체 절차와 세부 규칙은 `SKILL.md`의 "Multi-model panes (opencodex)" 섹션에 있습니다.
 

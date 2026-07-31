@@ -113,8 +113,10 @@ be_keys() {
   case "$BACKEND" in
     tmux) tmux send-keys -t "$id" "$@" ;;
     orca)
-      # only the keys this skill actually uses; a bare ESC byte can swallow the
-      # next char if sent back-to-back, hence the sleep after Escape.
+      # tmux key names → bytes. Unmapped names fall through as literal text, so
+      # keep dialog answers to mapped keys or digits. A bare ESC byte can swallow
+      # the next char if sent back-to-back, hence the sleep after Escape (arrow
+      # CSI sequences are complete and safe).
       local k
       for k in "$@"; do
         case "$k" in
@@ -123,6 +125,11 @@ be_keys() {
           C-c)    orca_send "$id" --interrupt ;;
           Tab)    orca_send "$id" --text "$(printf '\t')" ;;
           Space)  orca_send "$id" --text ' ' ;;
+          Up)     orca_send "$id" --text "$(printf '\033[A')" ;;
+          Down)   orca_send "$id" --text "$(printf '\033[B')" ;;
+          Right)  orca_send "$id" --text "$(printf '\033[C')" ;;
+          Left)   orca_send "$id" --text "$(printf '\033[D')" ;;
+          BSpace) orca_send "$id" --text "$(printf '\177')" ;;
           *)      orca_send "$id" --text "$k" ;;
         esac
       done
@@ -263,6 +270,28 @@ case "$cmd" in
       echo "FAIL lazycodex-plugin: omo@sisyphuslabs not found in $config"
       echo "HINT install with: npx lazycodex-ai install"
       ok=0
+    fi
+
+    # opencodex proxy (multi-model panes). Injected config + dead proxy means
+    # EVERY codex request fails, so that combination is a hard FAIL.
+    if grep -q '^openai_base_url' "$config" 2>/dev/null; then
+      if command -v ocx >/dev/null 2>&1 && ocx health >/dev/null 2>&1; then
+        echo "PASS opencodex: proxy healthy, injection present"
+      else
+        echo "FAIL opencodex: $config routes codex through the proxy but 'ocx health' fails — all codex requests will fail"
+        echo "HINT run: ocx start   (or 'ocx restore' to detach codex from the proxy)"
+        ok=0
+      fi
+      # orca copies ~/.codex/config.toml over CODEX_HOME on terminal create,
+      # silently erasing the injection if only the account home was synced.
+      if [ "$BACKEND" = "orca" ] && [ -f "$HOME/.codex/config.toml" ] \
+         && ! grep -q '^openai_base_url' "$HOME/.codex/config.toml"; then
+        echo "WARN opencodex: ~/.codex/config.toml lacks the injection — orca will erase it on the next terminal create"
+        echo "HINT run: env -u CODEX_HOME ocx sync"
+      fi
+    elif command -v ocx >/dev/null 2>&1 && ocx health >/dev/null 2>&1; then
+      echo "WARN opencodex: proxy is running but $config has no injection — routed models (-m provider/model) will not work"
+      echo "HINT run: ocx sync"
     fi
 
     if [ -n "$BACKEND" ]; then

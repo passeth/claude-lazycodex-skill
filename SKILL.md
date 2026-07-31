@@ -196,11 +196,13 @@ Hard-won rules:
 
 ### Orca pane input quirks (any model)
 
-`$PANE keys` on the orca backend maps ONLY `Enter`, `Escape`, `C-c`, `Tab`, `Space` —
-anything else (`Down`, `BSpace`, …) is sent as literal text into the composer. So:
+`$PANE keys` on the orca backend maps `Enter`, `Escape`, `C-c`, `Tab`, `Space`, the
+arrow keys, and `BSpace` — any other name is sent as **literal text** into the
+composer. So:
 
 - Answer codex dialogs (model switch, hooks trust) by sending the option **digit** as
-  text then `Enter`, never arrow keys.
+  text then `Enter` — it is one keypress and immune to mapping gaps. Arrows work too,
+  but verify with `peek` before `Enter`.
 - Never use `Escape` to "clear the composer" while codex is working — it interrupts the
   turn and pauses the harness goal (recover with `$PANE send '/goal resume'`).
 
