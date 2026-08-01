@@ -208,6 +208,13 @@ composer. So:
   but verify with `peek` before `Enter`.
 - Never use `Escape` to "clear the composer" while codex is working — it interrupts the
   turn and pauses the harness goal (recover with `$PANE send '/goal resume'`).
+- **Hook-trust resets per pane.** Orca's config rewrite (see above) also resets codex's
+  hooks-trust state, so the "Hooks need review" dialog can reappear on any new pane.
+  Answer it with `2` + `Enter` (Trust all — they are the user's own omo plugin hooks).
+- Orca can start typing the launch command before the shell finishes init, eating
+  leading characters (`command not found: odex`). `start` now detects this and relaunches
+  in the live shell automatically; readiness is judged by real codex markers, not
+  `tui-idle` (which is also true for a bare shell).
 
 ## Orca A2A multi-worker mode
 

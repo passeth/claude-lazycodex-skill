@@ -349,14 +349,30 @@ case "$cmd" in
     id="$(be_spawn "$launch")" || die "failed to create codex pane"
     echo "$id" > "$STATE_FILE"
     if [ "$BACKEND" = "orca" ]; then
-      # orca detects TUI readiness natively
-      if orca terminal wait --terminal "$id" --for tui-idle --timeout-ms 60000 --json 2>/dev/null \
-          | jq -e '.ok == true' >/dev/null 2>&1; then
-        echo "$id"
-        exit 0
-      fi
+      orca terminal wait --terminal "$id" --for tui-idle --timeout-ms 60000 --json 2>/dev/null \
+        | jq -e '.ok == true' >/dev/null 2>&1 || true
+      # tui-idle is not proof codex is up: orca can start typing --command before
+      # the shell finishes init, eating leading chars ("command not found: odex"),
+      # and the resulting bare shell is also "idle". Require a real codex marker,
+      # and relaunch once inside the live shell if the command got eaten.
+      relaunched=0
+      for _ in $(seq 1 30); do
+        screen="$(be_screen "$id")"
+        if echo "$screen" | grep -qiE 'Context .*left|esc to interrupt|Use /skills|Starting MCP'; then
+          echo "$id"
+          exit 0
+        fi
+        if [ "$relaunched" -eq 0 ] && echo "$screen" | grep -q 'command not found'; then
+          echo "WARN: orca ate the launch command (shell not ready); relaunching in the live shell" >&2
+          orca_send "$id" --text "$launch"
+          sleep 0.3
+          orca_send "$id" --enter
+          relaunched=1
+        fi
+        sleep 2
+      done
       echo "$id"
-      echo "WARN: codex not tui-idle after 60s; verify with: codex-pane.sh peek" >&2
+      echo "WARN: codex ready-marker not seen after 60s; verify with: codex-pane.sh peek" >&2
       exit 0
     fi
     for _ in $(seq 1 60); do
