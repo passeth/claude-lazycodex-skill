@@ -113,8 +113,10 @@ be_keys() {
   case "$BACKEND" in
     tmux) tmux send-keys -t "$id" "$@" ;;
     orca)
-      # only the keys this skill actually uses; a bare ESC byte can swallow the
-      # next char if sent back-to-back, hence the sleep after Escape.
+      # tmux key names → bytes. Unmapped names fall through as literal text, so
+      # keep dialog answers to mapped keys or digits. A bare ESC byte can swallow
+      # the next char if sent back-to-back, hence the sleep after Escape (arrow
+      # CSI sequences are complete and safe).
       local k
       for k in "$@"; do
         case "$k" in
@@ -123,6 +125,11 @@ be_keys() {
           C-c)    orca_send "$id" --interrupt ;;
           Tab)    orca_send "$id" --text "$(printf '\t')" ;;
           Space)  orca_send "$id" --text ' ' ;;
+          Up)     orca_send "$id" --text "$(printf '\033[A')" ;;
+          Down)   orca_send "$id" --text "$(printf '\033[B')" ;;
+          Right)  orca_send "$id" --text "$(printf '\033[C')" ;;
+          Left)   orca_send "$id" --text "$(printf '\033[D')" ;;
+          BSpace) orca_send "$id" --text "$(printf '\177')" ;;
           *)      orca_send "$id" --text "$k" ;;
         esac
       done
@@ -133,6 +140,30 @@ be_keys() {
       herdr pane send-keys "$id" "${args[@]}" >/dev/null
       ;;
   esac
+}
+
+ensure_proxy() {
+  # A live opencodex proxy is required when the pane pins a routed model
+  # (-m provider/model) or the codex config routes through the proxy
+  # (openai_base_url injection) — a dead proxy then fails every request.
+  command -v ocx >/dev/null 2>&1 || return 0
+  ocx health >/dev/null 2>&1 && return 0
+  echo "opencodex proxy down — starting (ocx ensure)…" >&2
+  # cold-start can exit unhealthy while the daemon is still warming up, so
+  # poll health instead of trusting the exit code (measured: ~8s warm-up).
+  ocx ensure >/dev/null 2>&1 || true
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    ocx health >/dev/null 2>&1 && { echo "opencodex proxy up" >&2; return 0; }
+    sleep 1
+  done
+  # last resort: ocx start runs in the foreground by design, so detach it.
+  (nohup ocx start >/dev/null 2>&1 &)
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    ocx health >/dev/null 2>&1 && { echo "opencodex proxy up" >&2; return 0; }
+    sleep 1
+  done
+  die "opencodex proxy failed to start — run 'ocx start' manually, or 'ocx restore' to detach codex from the proxy"
 }
 
 be_screen() {
@@ -265,6 +296,28 @@ case "$cmd" in
       ok=0
     fi
 
+    # opencodex proxy (multi-model panes). Injected config + dead proxy means
+    # EVERY codex request fails, so that combination is a hard FAIL.
+    if grep -q '^openai_base_url' "$config" 2>/dev/null; then
+      if command -v ocx >/dev/null 2>&1 && ocx health >/dev/null 2>&1; then
+        echo "PASS opencodex: proxy healthy, injection present"
+      else
+        echo "FAIL opencodex: $config routes codex through the proxy but 'ocx health' fails — all codex requests will fail"
+        echo "HINT run: ocx start   (or 'ocx restore' to detach codex from the proxy)"
+        ok=0
+      fi
+      # orca copies ~/.codex/config.toml over CODEX_HOME on terminal create,
+      # silently erasing the injection if only the account home was synced.
+      if [ "$BACKEND" = "orca" ] && [ -f "$HOME/.codex/config.toml" ] \
+         && ! grep -q '^openai_base_url' "$HOME/.codex/config.toml"; then
+        echo "WARN opencodex: ~/.codex/config.toml lacks the injection — orca will erase it on the next terminal create"
+        echo "HINT run: env -u CODEX_HOME ocx sync"
+      fi
+    elif command -v ocx >/dev/null 2>&1 && ocx health >/dev/null 2>&1; then
+      echo "WARN opencodex: proxy is running but $config has no injection — routed models (-m provider/model) will not work"
+      echo "HINT run: ocx sync"
+    fi
+
     if [ -n "$BACKEND" ]; then
       if id="$(get_pane)"; then
         echo "INFO codex-pane: $id ($(be_status "$id"))"
@@ -278,6 +331,12 @@ case "$cmd" in
   start)
     # start [initial-prompt] — create pane + launch codex; idempotent. Prints pane id.
     if id="$(get_pane)"; then echo "$id"; exit 0; fi
+    # auto-start the opencodex proxy when this pane needs it
+    case " ${LAZYCODEX_CODEX_ARGS:-}" in
+      *" -m "*/*) ensure_proxy ;;   # routed model (provider/model) requested
+      *) grep -q '^openai_base_url' "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null \
+           && ensure_proxy ;;       # config already routes through the proxy
+    esac
     # LAZYCODEX_CODEX_ARGS injects codex flags, e.g. -c 'mcp_servers={}' to launch
     # without MCP servers (each stdio MCP holds pipes against the codex app-server's
     # 256-fd launchd limit; a heavy MCP config wedges it with EMFILE).
@@ -290,14 +349,30 @@ case "$cmd" in
     id="$(be_spawn "$launch")" || die "failed to create codex pane"
     echo "$id" > "$STATE_FILE"
     if [ "$BACKEND" = "orca" ]; then
-      # orca detects TUI readiness natively
-      if orca terminal wait --terminal "$id" --for tui-idle --timeout-ms 60000 --json 2>/dev/null \
-          | jq -e '.ok == true' >/dev/null 2>&1; then
-        echo "$id"
-        exit 0
-      fi
+      orca terminal wait --terminal "$id" --for tui-idle --timeout-ms 60000 --json 2>/dev/null \
+        | jq -e '.ok == true' >/dev/null 2>&1 || true
+      # tui-idle is not proof codex is up: orca can start typing --command before
+      # the shell finishes init, eating leading chars ("command not found: odex"),
+      # and the resulting bare shell is also "idle". Require a real codex marker,
+      # and relaunch once inside the live shell if the command got eaten.
+      relaunched=0
+      for _ in $(seq 1 30); do
+        screen="$(be_screen "$id")"
+        if echo "$screen" | grep -qiE 'Context .*left|esc to interrupt|Use /skills|Starting MCP'; then
+          echo "$id"
+          exit 0
+        fi
+        if [ "$relaunched" -eq 0 ] && echo "$screen" | grep -q 'command not found'; then
+          echo "WARN: orca ate the launch command (shell not ready); relaunching in the live shell" >&2
+          orca_send "$id" --text "$launch"
+          sleep 0.3
+          orca_send "$id" --enter
+          relaunched=1
+        fi
+        sleep 2
+      done
       echo "$id"
-      echo "WARN: codex not tui-idle after 60s; verify with: codex-pane.sh peek" >&2
+      echo "WARN: codex ready-marker not seen after 60s; verify with: codex-pane.sh peek" >&2
       exit 0
     fi
     for _ in $(seq 1 60); do
